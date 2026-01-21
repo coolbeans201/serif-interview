@@ -6,6 +6,12 @@ Extracts machine-readable file URLs for Anthem PPO networks in New York state fr
 
 Under the [Transparency in Coverage](https://www.cms.gov/healthplan-price-transparency) rule, health insurers must publish machine-readable files with negotiated rates. This script parses Anthem's table-of-contents index file to find URLs for NY PPO networks.
 
+## Design Decisions
+
+1. Uses streaming JSON parsing (ijson) to handle large file without loading into memory
+2. Deduplicates URLs by file identifier, not full URL (same file served from multiple CDNs)
+3. Identifies NY PPO networks by both description field AND URL domain (for Empire BCBS)
+
 ## Requirements
 
 - Python 3.9+
@@ -18,7 +24,7 @@ pip install -r requirements.txt
 ## Usage
 
 ```bash
-# Full extraction (takes ~6 minutes, file is ~5GB)
+# Full extraction (takes ~10 minutes, file is ~5GB)
 python anthem_ny_ppo_scraper.py
 
 # Custom output file
