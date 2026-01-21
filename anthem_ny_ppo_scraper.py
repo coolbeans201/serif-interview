@@ -5,13 +5,18 @@ from the CMS Price Transparency index file.
 
 Usage:
     python anthem_ny_ppo_scraper.py [--output OUTPUT_FILE]
+
+Key design decisions:
+1. Uses streaming JSON parsing (ijson) to handle large file without loading into memory
+2. Deduplicates URLs by file identifier, not full URL (as the same file can be served from multiple CDNs)
+3. Identifies NY PPO networks by both description field and URL domain (for Empire BCBS)
 """
 
 import gzip
-import json
 import argparse
 import urllib.request
-from typing import Generator, Any
+import re
+from typing import Generator
 import ijson  # For streaming JSON parsing of large files
 
 
@@ -24,84 +29,73 @@ def stream_index_file(url: str) -> Generator[dict, None, None]:
     Uses ijson for memory-efficient parsing of large files.
     """
     print(f"Fetching index file from: {url}")
-    
+
     with urllib.request.urlopen(url) as response:
         with gzip.GzipFile(fileobj=response) as gz_file:
             # Use ijson to stream parse the JSON
             # The structure is: { "reporting_structure": [ { ... }, { ... } ] }
             parser = ijson.items(gz_file, 'reporting_structure.item')
-            
+
             for item in parser:
                 yield item
+
+
+def extract_file_id(url: str) -> str:
+    """
+    Extract the file identifier from a URL, ignoring CDN prefix and query params.
+
+    The same file often is served from multiple CDN domains (anthembcbsco, anthembcbsct,
+    empirebcbs, etc.). Therefore, we deduplicate by the actual file identifier.
+
+    Example:
+        https://anthembcca.mrf.bcbs.com/2026-01_302_42B0_in-network-rates_1_of_3.json.gz?...
+        -> 2026-01_302_42B0_in-network-rates_1_of_3.json.gz
+    """
+    base = url.split("?")[0]
+    return base.split("/")[-1]
 
 
 def is_ny_ppo_network(in_network_files: list[dict]) -> tuple[bool, list[dict]]:
     """
     Checks to see if any of the in_network_files represent a New York PPO network.
-    
+
     Returns:
         (is_match, matching_files) tuple
+
+    Detection is based on the description field, which identifies the network.
     
-    Exampme NY indicators in file descriptions:
-    - "New York", "NY" in description
-    - "Empire" (Empire BCBS is Anthem's NY brand)
-    - "Excellus" (Excellus BCBS covers upstate NY)
-    - "Highmark...NY" (Highmark Blue Shield of Northeastern NY)
+    Note: The URL domain (e.g., empirebcbs.mrf.bcbs.com) indicates which CDN is serving
+    the file. The same file may be served from multiple CDNs.
     
-    Example PPO indicators:
-    - "PPO" in description
+    Highmark (Western NY, Northeastern NY) is a separate BCBS licensee, not Anthem.
+    We include them as they serve NY PPO networks, but they are distinct from Anthem/Empire.
     """
     matching_files = []
-    
+
     for file_info in in_network_files:
-        description = file_info.get("description", "").upper()
+        description = file_info.get("description", "")
         location = file_info.get("location", "")
+        desc_upper = description.upper()
+
+        # Check for PPO indicator
+        is_ppo = "PPO" in desc_upper
         
-        # Check for PPO
-        is_ppo = "PPO" in description
+        # Check for NY indicators in description
+        ny_indicators = ["NEW YORK", " NY ", " NY:", "_NY_", "(NY)"]
+        is_ny = any(indicator in desc_upper for indicator in ny_indicators)
+        is_ny = is_ny or ("HIGHMARK" in desc_upper and "NY" in desc_upper)
         
-        # Check for New York
-        ny_indicators = [
-            "NEW YORK",
-            " NY ",
-            " NY:",
-            "_NY_",
-            "(NY)",
-            "EMPIRE",
-        ]
-        is_ny = any(indicator in description for indicator in ny_indicators)
-        
-        # Edge case: Highmark Northeastern NY
-        is_ny = is_ny or ("HIGHMARK" in description and "NY" in description)
-        
-        # Edge case: Excellus is NY-based, also check for PPO
-        is_excellus_ppo = "EXCELLUS" in description and is_ppo
-        
+        # Excellus BCBS covers upstate NY (Rochester, Syracuse, Utica)
+        is_excellus_ppo = "EXCELLUS" in desc_upper and is_ppo
+
         if (is_ppo and is_ny) or is_excellus_ppo:
             matching_files.append({
                 "url": location,
-                "description": file_info.get("description", "")
+                "description": description,
+                "file_id": extract_file_id(location)
             })
-    
+
     return len(matching_files) > 0, matching_files
-
-
-def extract_in_network_urls(item: dict) -> list[dict]:
-    """
-    Extract ALL in-network file URLs from a reporting_structure item.
-    """
-    urls = []
-    
-    in_network_files = item.get("in_network_files", [])
-    for file_info in in_network_files:
-        url = file_info.get("location", "")
-        description = file_info.get("description", "")
-        urls.append({
-            "url": url,
-            "description": description
-        })
-    
-    return urls
 
 
 def main():
@@ -110,59 +104,60 @@ def main():
     )
     parser.add_argument(
         "--output", "-o",
-        default="ny_ppo_urls.json",
-        help="Output file path (default: ny_ppo_urls.json)"
+        default="ny_ppo_urls.txt",
+        help="Output file path (default: ny_ppo_urls.txt)"
     )
     args = parser.parse_args()
-    
-    results = []
+
+    # Collect unique file IDs by network (deduplicate across CDNs)
+    file_ids_by_network: dict[str, dict[str, str]] = {}  # network -> {file_id: sample_url}
     processed = 0
-    matched = 0
-    
-    print("Starting to process Anthem index file...")
+
+    print("Starting to process the Anthem index file...")
     print("Looking for PPO plans in New York state...\n")
-    
+
     for item in stream_index_file(S3_URL):
         processed += 1
-        
+
         in_network_files = item.get("in_network_files", [])
-        reporting_plans = item.get("reporting_plans", [])
-        
         is_match, matching_files = is_ny_ppo_network(in_network_files)
-        
+
         if is_match:
-            matched += 1
-            
-            result = {
-                "reporting_plans": reporting_plans,
-                "ny_ppo_files": matching_files
-            }
-            results.append(result)
-            
-            # Print match info
-            for f in matching_files[:2]:
-                print(f"  Found: {f['description'][:80]}")
-    
+            for f in matching_files:
+                network = f["description"]
+                file_id = f["file_id"]
+                url = f["url"]
+
+                if network not in file_ids_by_network:
+                    file_ids_by_network[network] = {}
+
+                # Store one URL per file_id (they're all equivalent, just different CDNs)
+                if file_id not in file_ids_by_network[network]:
+                    file_ids_by_network[network][file_id] = url
+
+    # Count totals
+    total_unique_files = sum(len(files) for files in file_ids_by_network.values())
+
+    # Also count truly unique file IDs across all networks
+    all_file_ids = set()
+    for files in file_ids_by_network.values():
+        all_file_ids.update(files.keys())
+
     print(f"Total items processed: {processed}")
-    print(f"NY PPO matches found: {matched}")
-    
-    # Save results
+    print(f"Networks found: {len(file_ids_by_network)}")
+    print(f"Unique file IDs (deduplicated across CDNs): {len(all_file_ids)}")
+
+    # Write URLs to output file
     with open(args.output, 'w') as f:
-        json.dump({
-            "total_processed": processed,
-            "total_matches": matched,
-            "results": results
-        }, f, indent=2)
-    
+        for network in sorted(file_ids_by_network.keys()):
+            files = file_ids_by_network[network]
+            f.write(f"# {network} ({len(files)} files)\n")
+            for file_id in sorted(files.keys()):
+                url = files[file_id]
+                f.write(f"{url}\n")
+            f.write("\n")
+
     print(f"Results saved to: {args.output}")
-    
-    # Print summary of unique URLs
-    all_urls = set()
-    for result in results:
-        for file_info in result["ny_ppo_files"]:
-            all_urls.add(file_info["url"])
-    
-    print(f"\nUnique machine-readable file URLs: {len(all_urls)}")
 
 
 if __name__ == "__main__":
