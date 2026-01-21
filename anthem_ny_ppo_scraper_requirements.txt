@@ -1,0 +1,2 @@
+# Requirements for anthem_ny_ppo_scraper.py
+ijson>=3.2.0
